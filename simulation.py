@@ -1,58 +1,68 @@
+import os
 import json
 import numpy as np
-from rocket_physics import consts, Time, Mass, Vel, Thrust, Altitude
+from rocket_physics import consts, Vectors, Time, Mass, Vel, Thrust, Displacement
 
-# Optimized JSON multi-stage input profile mapping realistic parameters
+# JSON multi-stage configuration profile updated with a stronger crossrange lateral push on the Y-axis
 json_input_data = """
 {
     "initial_time": 0.0,
-    "runtime": 15.0,
-    "intervals": 3000,
+    "runtime": 60.0,
+    "intervals": 6000,
+    "pitchover_time": 3.0,
+    "pitchover_kick_vector": [0.25, 0.20, 0.93],
     "elements": {
         "stage_1": {
-            "wet_mass": 45.0,
-            "dry_mass": 15.0,
-            "payload": 10.0,
-            "burn_duration": 5.0,
-            "Vj": 2500.0,
-            "Cd": 0.20,
-            "Area": 0.05,
-            "apogee_config": 20000.0
+            "wet_mass": 450.0,
+            "dry_mass": 150.0,
+            "payload": 100.0,
+            "burn_duration": 15.0,
+            "Vj": 2900.0,
+            "Cd": 0.22,
+            "Area": 0.25,
+            "apogee_config": 80000.0
         },
         "stage_2": {
-            "wet_mass": 15.0,
-            "dry_mass": 5.0,
-            "payload": 2.0,
-            "burn_duration": 5.0,
-            "Vj": 3000.0,
+            "wet_mass": 150.0,
+            "dry_mass": 50.0,
+            "payload": 20.0,
+            "burn_duration": 20.0,
+            "Vj": 3400.0,
             "Cd": 0.15,
-            "Area": 0.03,
-            "apogee_config": 60000.0
+            "Area": 0.12,
+            "apogee_config": 250000.0
         }
     }
 }
 """
 
 if __name__ == "__main__":
+    # Load and parse the setup JSON profile configuration matrix
     config = json.loads(json_input_data)
     
     total_intervals = config["intervals"]
     t_start = config["initial_time"]
     t_end = config["runtime"]
+    pitchover_t = config["pitchover_time"]
+    
+    # Extracting the explicit 3-element array to drive authentic 3D spatial curves
+    kick_dir = np.array(config["pitchover_kick_vector"], dtype=float)
     
     global_time_vec = np.linspace(t_start, t_end, total_intervals)
     
+    # 3D trackers (shape initialized to (N, 3) for multi-dimensional telemetry channels)
     results = {
         "time": global_time_vec,
-        "altitude": np.zeros(total_intervals),
-        "actual_velocity": np.zeros(total_intervals),
-        "tsio_dv_gain": np.zeros(total_intervals),
-        "grav_dv_loss": np.zeros(total_intervals),
-        "drag_dv_loss": np.zeros(total_intervals),
+        "displacement": np.zeros((total_intervals, 3)),
+        "velocity": np.zeros((total_intervals, 3)),
+        "orientation_n": np.zeros((total_intervals, 3)), 
+        "tsio_dv_gain": np.zeros((total_intervals, 3)),
+        "grav_dv_loss": np.zeros((total_intervals, 3)),
+        "drag_dv_loss": np.zeros((total_intervals, 3)),
         "inst_mass": np.zeros(total_intervals),
-        "f_thrust_inertial": np.zeros(total_intervals),
-        "f_drag": np.zeros(total_intervals),
-        "f_grav": np.zeros(total_intervals)
+        "f_thrust": np.zeros((total_intervals, 3)),
+        "f_drag": np.zeros((total_intervals, 3)),
+        "f_grav": np.zeros((total_intervals, 3))
     }
     
     stages_data = config["elements"]
@@ -61,21 +71,22 @@ if __name__ == "__main__":
     
     intervals_per_stage = total_intervals // num_stages
     
-    current_alt = 0.0
-    current_vel = 0.0
-    accumulated_grav_loss = 0.0
-    accumulated_drag_loss = 0.0
+    # Initialize the rocket displacement vector system instance at origin
+    rocket_displacement = Displacement(np.array([0.0, 0.0, 0.0]))
+    current_vel = np.array([0.0, 0.0, 0.0]) 
+    
+    # Initialize 3D telemetry tracking vectors
+    accumulated_grav_loss_vec = np.array([0.0, 0.0, 0.0])
+    accumulated_drag_loss_vec = np.array([0.0, 0.0, 0.0])
     
     thrust_calculator = Thrust()
+    vec_manager = Vectors() 
     
     for stage_idx, stage_name in enumerate(stage_keys):
         stage_cfg = stages_data[stage_name]
         
         start_idx = stage_idx * intervals_per_stage
-        if stage_idx == num_stages - 1:
-            end_idx = total_intervals
-        else:
-            end_idx = (stage_idx + 1) * intervals_per_stage
+        end_idx = total_intervals if stage_idx == num_stages - 1 else (stage_idx + 1) * intervals_per_stage
             
         stage_mass = Mass(dry_mass=stage_cfg["dry_mass"], wet_mass=stage_cfg["wet_mass"], payload=stage_cfg["payload"])
         stage_mass.calc_m_dot(stage_cfg["burn_duration"])
@@ -87,62 +98,80 @@ if __name__ == "__main__":
         
         for t in range(start_idx, end_idx):
             current_time = global_time_vec[t]
+            current_alt = rocket_displacement.get_altitude()
             
-            # Ground limit check to prevent downward numerical inversion
-            if current_alt < 0.0:
-                current_alt = 0.0
-                if current_vel < 0.0:
-                    current_vel = 0.0
-            
+            # Continuous mass flux step calculation
             inst_m = stage_mass.get_inst_mass(current_time, stage_start_time, stage_cfg["burn_duration"])
-            f_thrust = thrust_calculator.calc_time_varying_inertial(stage_mass, current_time, stage_start_time, stage_cfg["burn_duration"], stage_cfg["Vj"])
-            f_drag = thrust_calculator.calc_drag_force(stage_cfg["Cd"], stage_cfg["Area"], current_vel, current_alt)
-            f_grav = thrust_calculator.calc_grav_force(current_alt, inst_m)
             
-            # Log metrics to arrays
-            results["altitude"][t] = current_alt
-            results["actual_velocity"][t] = current_vel
+            # Dynamically compute orientation unit vector (n) for this frame step block
+            n_hat = vec_manager.get_pointing_vector(current_time, pitchover_t, kick_dir, current_vel)
+            
+            # Vector forces calculations mapping orientations rules
+            f_thrust = thrust_calculator.calc_time_varying_inertial(stage_mass, current_time, stage_start_time, stage_cfg["burn_duration"], stage_cfg["Vj"], n_hat)
+            f_drag = thrust_calculator.calc_drag_force(stage_cfg["Cd"], stage_cfg["Area"], current_vel, current_alt, n_hat)
+            f_grav = thrust_calculator.calc_grav_force(current_alt, inst_m, vec_manager.k)
+            
+            # Log frames into multidimensional dictionary arrays configuration cleanly
+            results["displacement"][t] = rocket_displacement.vector
+            results["velocity"][t] = current_vel
+            results["orientation_n"][t] = n_hat
             results["inst_mass"][t] = inst_m
-            results["f_thrust_inertial"][t] = f_thrust
+            results["f_thrust"][t] = f_thrust
             results["f_drag"][t] = f_drag
             results["f_grav"][t] = f_grav
             
-            # Populate complementary telemetry vector trackers sequentially
-            results["tsio_dv_gain"][t] = stage_vel_obj.calc_tsio_del_vel(stage_cfg["Vj"], inst_m, stage_cfg["wet_mass"])
-            results["grav_dv_loss"][t] = stage_vel_obj.calc_grav_del_vel(accumulated_grav_loss)
-            results["drag_dv_loss"][t] = stage_vel_obj.calc_drag_del_vel(accumulated_drag_loss)
+            # Submitting vector parameters to the upgraded loss tracking methods
+            results["tsio_dv_gain"][t] = stage_vel_obj.calc_tsio_del_vel(stage_cfg["Vj"], inst_m, stage_cfg["wet_mass"], n_hat)
+            results["grav_dv_loss"][t] = stage_vel_obj.calc_grav_del_vel(accumulated_grav_loss_vec)
+            results["drag_dv_loss"][t] = stage_vel_obj.calc_drag_del_vel(accumulated_drag_loss_vec)
             
+            # Integrate kinematics forward into the next step frame boundaries
             if t < total_intervals - 1:
                 step_dt = float(global_time_vec[t+1] - current_time)
                 
-                # Kinematic Acceleration Integration: a = (F_thrust - F_drag - F_grav) / mass
-                # Rocket stays stationary on pad until thrust exceeds gravity forces
-                if current_alt == 0.0 and f_thrust <= f_grav:
-                    acceleration = 0.0
-                    current_vel = 0.0
+                # Check launch threshold parameters using vertical axis and thrust elements
+                if current_alt == 0.0 and np.linalg.norm(f_thrust) <= np.linalg.norm(f_grav):
+                    acceleration = np.zeros(3)
+                    current_vel = np.zeros(3)
                 else:
-                    acceleration = (f_thrust - f_drag - f_grav) / inst_m
-                    # Component loss integration
-                    accumulated_grav_loss += (f_grav / inst_m) * step_dt
-                    accumulated_drag_loss += (f_drag / inst_m) * step_dt
+                    # 3D Vector summing forces expression
+                    net_force = f_thrust + f_drag + f_grav
+                    acceleration = net_force / inst_m
                     
-                    # Update true physical state values forward
+                    # Accumulate 3D loss integrations over time frames
+                    accumulated_grav_loss_vec += (f_grav / inst_m) * step_dt
+                    accumulated_drag_loss_vec += (f_drag / inst_m) * step_dt
+                    
                     current_vel += acceleration * step_dt
                 
-                current_alt += current_vel * step_dt
+                # Dynamic vector displacement state shift
+                rocket_displacement.update_position(current_vel, step_dt)
+                
+                # Clamp ground boundaries immediately after updating spatial positions
+                if rocket_displacement.get_altitude() < 0.0:
+                    rocket_displacement.reset_ground_limit()
+                    if current_vel[2] < 0.0:
+                        current_vel[2] = 0.0  # Arrest downward velocity on vertical Z component channel
 
-    # Binary file save execution block
+    # Enforce safe folder handling using the os module wrapper
+    os.makedirs("simulated_data", exist_ok=True)
+    
+    # Save the complete multi-dimensional array matrix package payload to disk
     np.savez(
-        "flight_telemetry.npz", 
+        "simulated_data/flight_telemetry_gravity_turn_3d_displacement.npz", 
         time=results["time"], 
-        altitude=results["altitude"], 
-        velocity=results["actual_velocity"], 
-        thrust=results["f_thrust_inertial"], 
+        displacement=results["displacement"], 
+        velocity=results["velocity"], 
+        orientation=results["orientation_n"],
+        thrust=results["f_thrust"], 
         drag=results["f_drag"],
-        gravity_loss=results["grav_dv_loss"],
-        drag_loss=results["drag_dv_loss"]
+        gravity=results["f_grav"],
+        tsio_dv_gain=results["tsio_dv_gain"], 
+        gravity_loss=results["grav_dv_loss"], 
+        drag_loss=results["drag_dv_loss"],
     )
     
-    print("--- KINEMATIC INTEGRATION COMPLETE: ARRAYS VALIDATED ---")
-    print(f"Peak Operational Speed Achieved: {np.max(results['actual_velocity']):.2f} m/s")
-    print(f"Max Altitude Achieved: {np.max(results['altitude']):.2f} meters")
+    print("--- 3D GRAVITY TURN KINEMATIC INTEGRATION COMPLETE ---")
+    print(f"Max Altitude Achieved (Z component): {np.max(results['displacement'][:, 2]):.2f} meters")
+    print(f"Final Downrange (X axis): {results['displacement'][-1, 0]:.2f} meters")
+    print(f"Final Crossrange (Y axis): {results['displacement'][-1, 1]:.2f} meters")
